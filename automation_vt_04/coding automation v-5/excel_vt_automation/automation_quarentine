@@ -1,0 +1,200 @@
+import vt
+import pandas as pd
+import time
+import os
+import json
+import random
+from itertools import cycle
+from urllib.parse import urlparse
+from tqdm import tqdm
+import requests
+
+# ==============================================================================
+# ✅ KONFIGURASI
+# ==============================================================================
+
+# MASUKKAN API KEY VIRUSTOTAL ANDA DI SINI
+API_KEYS = [
+    "5450114063fce902dfbea60578a32b1d5d4f5eeafbb69df65f0d5561cd74261e",
+    "86a8e4a5969e5a587012b1443dbed324f21750134a53f113b9c004577cfdd32b"
+    # "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+]
+
+# MASUKKAN LINK GOOGLE SHEET (CSV) ANDA DI SINI
+# Dapatkan dari File -> Bagikan -> Publikasikan ke web -> pilih .csv
+INPUT_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQxQJnAvysIrX9EPjWbsCEACnDpZOai8kBUyA8BrEUsp1rKdXKM-hLDLzWnVKmpEdKmjsYmpOwnqegJ/pub?gid=0&single=true&output=csv"
+
+OUTPUT_FILE = "gmail_domains_with_scores.xlsx"
+DOMAIN_COLUMN = "Domain"  # Pastikan nama kolom di spreadsheet Anda sesuai
+CACHE_FILE = "vt_cache.json"
+MAX_RETRIES = 3
+
+# Pengecekan awal
+if not API_KEYS or "xxxxxxxx" in API_KEYS[0]:
+    print("🚨 Peringatan: Harap masukkan API Key VirusTotal Anda di dalam list `API_KEYS`.")
+
+
+# VirusTotal free API allows 4 requests per minute per key
+MAX_REQUESTS_PER_MINUTE_PER_KEY = 4
+TOTAL_KEYS = len(API_KEYS) if API_KEYS else 1
+MAX_REQUESTS_PER_MINUTE = MAX_REQUESTS_PER_MINUTE_PER_KEY * TOTAL_KEYS
+
+# Hitung delay antar request (lebih longgar dari limit)
+SAFE_REQUESTS_PER_MIN = MAX_REQUESTS_PER_MINUTE // 2  # pakai 50% quota biar aman
+DELAY_BETWEEN_REQUESTS = 60 / SAFE_REQUESTS_PER_MIN if SAFE_REQUESTS_PER_MIN > 0 else 15
+
+# ==============================================================================
+# 🧠 STATE
+# ==============================================================================
+
+cache_skor = {}
+key_cycle = cycle(API_KEYS) if API_KEYS else None  # round-robin API key
+
+
+# ==============================================================================
+# 🔧 FUNGSI (Tidak ada perubahan di sini)
+# ==============================================================================
+
+def extract_domain(value):
+    """Mengekstrak nama domain bersih dari email atau URL."""
+    if pd.isna(value):
+        return None
+    value = str(value).strip()
+    if '@' in value:
+        return value.split('@')[-1]
+    try:
+        # Menambahkan http jika tidak ada skema untuk parsing yang benar
+        parsed_url = value if '://' in value else 'http://' + value
+        parsed = urlparse(parsed_url)
+        return parsed.netloc or parsed.path
+    except Exception:
+        return value  # Kembalikan nilai asli jika parsing gagal
+
+
+def load_cache():
+    """Memuat cache skor dari file JSON."""
+    global cache_skor
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, 'r') as f:
+            try:
+                cache_skor = json.load(f)
+            except json.JSONDecodeError:
+                cache_skor = {}
+
+
+def save_cache():
+    """Menyimpan cache skor ke file JSON."""
+    with open(CACHE_FILE, 'w') as f:
+        json.dump(cache_skor, f, indent=4)
+
+
+def get_vt_score(domain, api_key):
+    """Query VirusTotal untuk 1 domain dengan penanganan error."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            with vt.Client(api_key) as client:
+                # Objek URL bisa memberikan info lebih, tapi domain lebih umum
+                obj = client.get_object(f"/domains/{domain}")
+                stats = obj.last_analysis_stats
+                malicious = stats.get('malicious', 0)
+                total = sum(stats.values())
+                return f"{malicious}/{total}"
+        except Exception as e:
+            err_msg = str(e)
+
+            if "NotAllowedError" in err_msg or "banned" in err_msg.lower():
+                tqdm.write(f"🚨 API Key {api_key[:4]}... mungkin terkena BAN sementara! Ganti key.")
+                return "Error: Banned"
+            
+            if "NotFoundError" in err_msg:
+                tqdm.write(f"❓ Domain '{domain}' tidak ditemukan di VirusTotal.")
+                return "Not Found"
+
+            if "QuotaExceededError" in err_msg:
+                tqdm.write(f"⚠️ API Key {api_key[:4]}... quota habis. Ganti key dan tunggu.")
+                # Jika hanya 1 key, tunggu 1 menit
+                if TOTAL_KEYS == 1:
+                    time.sleep(61)
+                continue # Coba lagi dengan key berikutnya
+
+            tqdm.write(f" Eror pada domain '{domain}': {err_msg}")
+            if attempt < MAX_RETRIES - 1:
+                sleep_time = (2 ** attempt) + random.uniform(0.5, 1.5)
+                tqdm.write(f"   -> Mencoba lagi dalam {sleep_time:.1f} detik...")
+                time.sleep(sleep_time)
+            else:
+                tqdm.write(f"   -> Gagal setelah {MAX_RETRIES} percobaan.")
+                return f"Error: {err_msg}"
+    return "Error: Max retries with quota issue"
+
+
+# ==============================================================================
+# 🧩 MAIN
+# ==============================================================================
+
+def main():
+    if "PASTE_YOUR" in INPUT_SHEET_URL or not API_KEYS:
+        print("❌ Skrip dihentikan. Mohon periksa konfigurasi API_KEYS dan INPUT_SHEET_URL di atas.")
+        return
+
+    print("📥 Mengunduh data dari Google Sheet...")
+    try:
+        df = pd.read_csv(INPUT_SHEET_URL)
+        print("✅ Data berhasil diunduh.")
+    except Exception as e:
+        print(f"❌ Gagal membaca data dari URL: {e}")
+        print("   Pastikan URL benar dan sheet telah dipublikasikan sebagai CSV.")
+        return
+
+    load_cache()
+    
+    if DOMAIN_COLUMN not in df.columns:
+        print(f"❌ Kolom '{DOMAIN_COLUMN}' tidak ditemukan di spreadsheet.")
+        print(f"   Kolom yang tersedia: {list(df.columns)}")
+        return
+
+    if 'VT_Score' not in df.columns:
+        df['VT_Score'] = ""
+    else:
+        # Pastikan kolom bisa diisi dengan string
+        df['VT_Score'] = df['VT_Score'].astype(object)
+
+    # Buat kolom sementara untuk domain bersih dan index asli
+    df['__domain'] = df[DOMAIN_COLUMN].apply(extract_domain)
+    df_need_scan = df[df['__domain'].notna()].copy()
+
+    # Iterasi pada baris yang perlu di-scan
+    for idx, row in tqdm(df_need_scan.iterrows(), total=len(df_need_scan), desc="Scanning Domains"):
+        domain = row['__domain']
+        
+        # Cek apakah skor sudah ada di file output (jika skrip dijalankan ulang)
+        current_score = str(df.at[idx, 'VT_Score'])
+        if pd.notna(current_score) and current_score.strip() not in ["", "nan"]:
+            continue # Lewati jika sudah ada skor
+
+        # Cek cache
+        if domain in cache_skor:
+            skor = cache_skor[domain]
+        else:
+            api_key = next(key_cycle)
+            skor = get_vt_score(domain, api_key)
+            cache_skor[domain] = skor
+            save_cache()  # Simpan cache setiap ada hasil baru
+            
+            # Tunggu sebelum request berikutnya
+            time.sleep(DELAY_BETWEEN_REQUESTS + random.uniform(0.1, 0.5))
+        
+        # Tulis skor ke DataFrame utama
+        df.at[idx, 'VT_Score'] = skor
+
+    # Hapus kolom sementara
+    df.drop(columns=["__domain"], inplace=True)
+    
+    try:
+        df.to_excel(OUTPUT_FILE, index=False, engine="openpyxl")
+        print(f"\n✅ Selesai! Hasil disimpan di '{OUTPUT_FILE}'.")
+    except Exception as e:
+        print(f"\n❌ Gagal menyimpan file Excel: {e}")
+
+if __name__ == "__main__":
+    main()
